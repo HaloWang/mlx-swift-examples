@@ -85,6 +85,9 @@ private func compileL2Norm() -> @Sendable (MLXArray) -> MLXArray {
     }
 }
 
+private let rwkvAddCMul = compileAddCMul()
+private let rwkvL2Norm = compileL2Norm()
+
 private func makeWkv7Kernel() -> MLXFast.MLXFastKernel? {
     let source = """
         auto n = thread_position_in_grid.z;
@@ -359,12 +362,12 @@ private class Rwkv7TimeMixing: Module {
         let xPrev = self.tokenShift(x, tokenShiftCache)
         let xDelta = xPrev - x
 
-        let xR = compileAddCMul()(x, xDelta, self.xR)
-        let xW = compileAddCMul()(x, xDelta, self.xW)
-        let xK = compileAddCMul()(x, xDelta, self.xK)
-        let xV = compileAddCMul()(x, xDelta, self.xV)
-        let xA = compileAddCMul()(x, xDelta, self.xA)
-        let xG = compileAddCMul()(x, xDelta, self.xG)
+        let xR = rwkvAddCMul(x, xDelta, self.xR)
+        let xW = rwkvAddCMul(x, xDelta, self.xW)
+        let xK = rwkvAddCMul(x, xDelta, self.xK)
+        let xV = rwkvAddCMul(x, xDelta, self.xV)
+        let xA = rwkvAddCMul(x, xDelta, self.xA)
+        let xG = rwkvAddCMul(x, xDelta, self.xG)
 
         let key = self.kProj(xK).reshaped(B, L, numHeads, headDim)
         let value = self.vProj(xV).reshaped(B, L, numHeads, headDim)
@@ -380,12 +383,12 @@ private class Rwkv7TimeMixing: Module {
             valueFinal = value
         } else {
             let vV = sigmoid(self.vLora!(xV)).reshaped(B, L, numHeads, headDim)
-            valueFinal = compileAddCMul()(value, vFirst! - value, vV)
+            valueFinal = rwkvAddCMul(value, vFirst! - value, vV)
         }
 
         var decay = sigmoid(self.wLora(xW).reshaped(B, L, numHeads, headDim)).asType(.float32)
         decay = exp(-0.606531 * decay).asType(receptance.dtype)
-        let kK: MLXArray = compileL2Norm()(key * self.kK)
+        let kK: MLXArray = rwkvL2Norm(key * self.kK)
         let keyFinal = key * (1 + (iclr - 1) * self.kA)
         let a = -kK
         let b = kK * iclr
@@ -425,7 +428,7 @@ private class Rwkv7ChannelMixing: Module {
             cache[2] = x[0..., (L - 1)..., 0...]
         }
         let xPrev = self.tokenShift(x, state)
-        let xx = compileAddCMul()(x, xPrev - x, self.xK)
+        let xx = rwkvAddCMul(x, xPrev - x, self.xK)
         return self.value(reluSquared(self.key(xx)))
     }
 }
