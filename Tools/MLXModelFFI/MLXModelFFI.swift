@@ -755,9 +755,9 @@ public func mlx_model_eval_finish(_ handle: UnsafeMutableRawPointer?, _ logits: 
 // One speculative token is retained so stop/cancel can restore the prior state.
 @_cdecl("mlx_device_greedy_step")
 public func mlx_device_greedy_step(
-    _ handle: UnsafeMutableRawPointer?, _ token: UnsafeMutablePointer<Int32>?
+    _ handle: UnsafeMutableRawPointer?, _ outputToken: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    guard let handle, let token else { return -1 }
+    guard let handle, let outputToken else { return -1 }
     let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
     guard !context.deferredEvalPending, context.model is Rwkv7Model, let previousLogits = context.greedyLogits,
         previousLogits.ndim == 3, previousLogits.dim(0) == 1,
@@ -770,7 +770,7 @@ public func mlx_device_greedy_step(
         let result = try evaluateModel(context, input: LMInput(tokens: previousToken.reshaped(1)))
         let nextToken = argMax(result[0, -1, 0...]).asType(.int32)
         asyncEval(nextToken)
-        token.pointee = previousToken.item(Int32.self)
+        outputToken.pointee = previousToken.item(Int32.self)
         context.greedyLogits = result
         context.greedyToken = nextToken
         context.greedyRollbackState = previousState
@@ -810,9 +810,9 @@ public func mlx_device_sample_proposal(
     _ handle: UnsafeMutableRawPointer?, _ temperature: Float, _ topK: Int32,
     _ topP: Float, _ randomDraw: UInt32, _ biasIds: UnsafePointer<Int32>?,
     _ biases: UnsafePointer<Float>?, _ biasCount: Int32,
-    _ token: UnsafeMutablePointer<Int32>?, _ priorLogits: UnsafeMutablePointer<Float>?
+    _ outputToken: UnsafeMutablePointer<Int32>?, _ priorLogits: UnsafeMutablePointer<Float>?
 ) -> Int32 {
-    guard let handle, let token, let priorLogits, temperature.isFinite,
+    guard let handle, let outputToken, let priorLogits, temperature.isFinite,
         topP.isFinite, topP > 0.0001, topP <= 1, topK > 1, topK <= 256,
         randomDraw >= 1, randomDraw <= 2147483646, biasCount >= 0,
         biasCount == 0 || (biasIds != nil && biases != nil) else { return -1 }
@@ -853,7 +853,7 @@ public func mlx_device_sample_proposal(
         verificationData.data.withUnsafeBytes { bytes in
             priorLogits.initialize(from: bytes.bindMemory(to: Float.self).baseAddress!, count: context.config.vocabSize)
         }
-        token.pointee = proposal.item(Int32.self)
+        outputToken.pointee = proposal.item(Int32.self)
         context.greedyLogits = result
         context.greedyToken = nil
         context.greedyRollbackState = previousState
