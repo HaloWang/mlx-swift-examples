@@ -15,6 +15,19 @@ private final class ModelContext {
     let model: any LanguageModel
     let config: FFIModelConfig
     var cache: [KVCache]
+    var greedyLogits: MLXArray?
+    var greedyToken: MLXArray?
+    var greedyRollbackState: [[MLXArray]]?
+    var greedyRollbackLogits: MLXArray?
+    var deferredEvalPending = false
+
+    func invalidateGreedy() {
+        greedyLogits = nil
+        greedyToken = nil
+        greedyRollbackState = nil
+        greedyRollbackLogits = nil
+        deferredEvalPending = false
+    }
 
     init(modelDirectory: URL, model: any LanguageModel, config: FFIModelConfig) {
         self.modelDirectory = modelDirectory
@@ -209,7 +222,7 @@ private func ensureCacheBatchSize(_ context: ModelContext, batchSize: Int) -> Bo
 
     for cacheIndex in 0..<context.cache.count {
         let state = context.cache[cacheIndex].state
-        if state.isEmpty {
+        if state.isEmpty || state.allSatisfy({ $0.dim(0) == batchSize }) {
             continue
         }
         context.cache[cacheIndex].state = state.map { resizeArrayBatch($0, batchSize: batchSize) }
@@ -227,6 +240,9 @@ private func evaluateModel(_ context: ModelContext, input: LMInput) throws -> ML
             } else {
                 modelInput = tokens
             }
+            if let model = context.model as? Rwkv7Model {
+                return model.lastLogits(modelInput.tokens, cache: context.cache.isEmpty ? nil : context.cache)
+            }
             let out = context.model(modelInput, cache: context.cache.isEmpty ? nil : context.cache, state: nil)
             return out.logits
         case .logits(let out):
@@ -235,43 +251,44 @@ private func evaluateModel(_ context: ModelContext, input: LMInput) throws -> ML
 }
 
 private func copyLastLogits(_ result: MLXArray, expectedBatchSize: Int, to logits: UnsafeMutablePointer<Float>) -> Int32 {
-    let float32Logits = result.dtype == .float32 ? result : result.asType(.float32)
-
-    let logitsArray: MLXArray
-    if float32Logits.ndim == 3 {
-        let batchSize = float32Logits.dim(0)
-        let seqLen = float32Logits.dim(1)
+    let lastLogits: MLXArray
+    if result.ndim == 3 {
+        let batchSize = result.dim(0)
+        let seqLen = result.dim(1)
         guard batchSize == expectedBatchSize, seqLen > 0 else {
-            setFFIError("invalid logits shape: \(float32Logits.shape), expected batch \(expectedBatchSize)")
+            setFFIError("invalid logits shape: \(result.shape), expected batch \(expectedBatchSize)")
             return -1
         }
         if expectedBatchSize == 1 {
-            logitsArray = float32Logits[0, -1, 0...]
+            lastLogits = result[0, -1, 0...]
         } else {
-            logitsArray = float32Logits[0..., -1, 0...]
+            lastLogits = result[0..., -1, 0...]
         }
-    } else if float32Logits.ndim == 2 && expectedBatchSize == 1 {
-        let seqLen = float32Logits.dim(0)
+    } else if result.ndim == 2 && expectedBatchSize == 1 {
+        let seqLen = result.dim(0)
         guard seqLen > 0 else {
-            setFFIError("invalid logits shape: \(float32Logits.shape)")
+            setFFIError("invalid logits shape: \(result.shape)")
             return -1
         }
-        logitsArray = float32Logits[-1, 0...]
+        lastLogits = result[-1, 0...]
     } else {
-        setFFIError("unsupported logits shape: \(float32Logits.shape)")
+        setFFIError("unsupported logits shape: \(result.shape)")
         return -1
     }
 
+    let logitsArray = lastLogits.dtype == .float32 ? lastLogits : lastLogits.asType(.float32)
     let logitsCount = logitsArray.size
     guard logitsCount > 0 else {
         setFFIError("invalid logits size: \(logitsCount)")
         return -1
     }
 
-    let logitsData = logitsArray.asData(access: .copy)
-    logitsData.data.withUnsafeBytes { bytes in
-        let floatBytes = bytes.bindMemory(to: Float.self)
-        logits.initialize(from: floatBytes.baseAddress!, count: logitsCount)
+    withExtendedLifetime(logitsArray) {
+        let logitsData = logitsArray.asData(access: .copy)
+        logitsData.data.withUnsafeBytes { bytes in
+            let floatBytes = bytes.bindMemory(to: Float.self)
+            logits.initialize(from: floatBytes.baseAddress!, count: logitsCount)
+        }
     }
 
     return 0
@@ -305,6 +322,7 @@ public func mlx_model_eval(
     }
 
     let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    context.invalidateGreedy()
     do {
         guard ensureCacheBatchSize(context, batchSize: 1) else {
             return -1
@@ -314,6 +332,7 @@ public func mlx_model_eval(
         let inputTokens = MLXArray(idsArray)
         let input = LMInput(tokens: inputTokens)
         let result = try evaluateModel(context, input: input)
+        context.greedyLogits = result
         return copyLastLogits(result, expectedBatchSize: 1, to: logits)
 
     } catch {
@@ -350,6 +369,7 @@ public func mlx_model_eval_batch_tokens(
     }
 
     let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    context.invalidateGreedy()
     let batchCount = Int(batchSize)
     do {
         guard ensureCacheBatchSize(context, batchSize: batchCount) else {
@@ -360,6 +380,7 @@ public func mlx_model_eval_batch_tokens(
         let inputTokens = MLXArray(idsArray).reshaped(batchCount, 1)
         let input = LMInput(tokens: inputTokens)
         let result = try evaluateModel(context, input: input)
+        if batchCount == 1 { context.greedyLogits = result }
         return copyLastLogits(result, expectedBatchSize: batchCount, to: logits)
     } catch {
         setFFIError("batch eval failed: \(error)")
@@ -436,9 +457,7 @@ private func readCacheSlot(_ context: ModelContext, slot: Int, buffer: UnsafeMut
         return -1
     }
 
-    var offset = 0
-    let bufferPtr = buffer.assumingMemoryBound(to: UInt8.self)
-
+    var slotArrays: [MLXArray] = []
     for cache in context.cache {
         let state = cache.state
         let arrays = state.isEmpty
@@ -457,17 +476,22 @@ private func readCacheSlot(_ context: ModelContext, slot: Int, buffer: UnsafeMut
                 slotArray = array[slot ..< (slot + 1), 0...]
             }
 
-            let fp16Array = slotArray.dtype == .float16 ? slotArray : slotArray.asType(.float16)
-            fp16Array.eval()
+            slotArrays.append(slotArray.dtype == .float16 ? slotArray : slotArray.asType(.float16))
+        }
+    }
 
-            let arrayData = fp16Array.asData(access: .copy)
+    guard slotArrays.reduce(0, { $0 + $1.nbytes }) <= Int(bufferSize) else {
+        setFFIError("buffer too small for cache data")
+        return -1
+    }
+
+    eval(slotArrays)
+    var offset = 0
+    let bufferPtr = buffer.assumingMemoryBound(to: UInt8.self)
+    for array in slotArrays {
+        withExtendedLifetime(array) {
+            let arrayData = array.asData(access: .noCopyIfContiguous)
             let arraySize = arrayData.data.count
-
-            guard offset + arraySize <= Int(bufferSize) else {
-                setFFIError("buffer too small for cache data")
-                return -1
-            }
-
             _ = arrayData.data.withUnsafeBytes { bytes in
                 memcpy(bufferPtr.advanced(by: offset), bytes.baseAddress!, arraySize)
             }
@@ -498,6 +522,7 @@ private func writeCacheSlot(_ context: ModelContext, slot: Int, buffer: UnsafeRa
     var offset = 0
     let bufferPtr = buffer.assumingMemoryBound(to: UInt8.self)
 
+    context.invalidateGreedy()
     for cacheIndex in 0..<context.cache.count {
         let state = context.cache[cacheIndex].state
         let shapes = slotShapes(for: context.cache[cacheIndex], context: context)
@@ -534,6 +559,7 @@ private func zeroCacheSlot(_ context: ModelContext, slot: Int) -> Int32 {
         return -1
     }
 
+    context.invalidateGreedy()
     for cacheIndex in 0..<context.cache.count {
         let state = context.cache[cacheIndex].state
         let shapes = slotShapes(for: context.cache[cacheIndex], context: context)
@@ -640,4 +666,203 @@ public func mlx_cache_zero_slot(
 
     let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
     return zeroCacheSlot(context, slot: Int(slot))
+}
+
+// Experimental native diagnostic; no product caller or general sampling claim.
+@_cdecl("mlx_greedy_pipeline_probe")
+public func mlx_greedy_pipeline_probe(
+    _ handle: UnsafeMutableRawPointer?, _ ids: UnsafePointer<Int32>?,
+    _ idsLength: Int32, _ tokenCount: Int32, _ pipelined: Int32,
+    _ output: UnsafeMutablePointer<Int32>?, _ logits: UnsafeMutablePointer<Float>?,
+    _ timings: UnsafeMutablePointer<Double>?
+) -> Int32 {
+    guard let handle, let ids, let output, let logits, let timings,
+        idsLength > 0, tokenCount > 0, tokenCount <= 8192,
+        pipelined == 0 || pipelined == 1 else { return -1 }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    do {
+        guard ensureCacheBatchSize(context, batchSize: 1) else { return -1 }
+        let start = ProcessInfo.processInfo.systemUptime
+        let input = MLXArray(Array(UnsafeBufferPointer(start: ids, count: Int(idsLength))))
+        var result = try evaluateModel(context, input: LMInput(tokens: input))
+        guard copyLastLogits(result, expectedBatchSize: 1, to: logits) == 0 else { return -1 }
+        var token = argMax(result[0, -1, 0...]).asType(.int32)
+        output[0] = token.item(Int32.self)
+        let first = ProcessInfo.processInfo.systemUptime
+        if tokenCount > 1 {
+            for index in 1..<Int(tokenCount) {
+                let previous = token
+                result = try evaluateModel(context, input: LMInput(tokens: previous.reshaped(1)))
+                token = argMax(result[0, -1, 0...]).asType(.int32)
+                if pipelined == 1 {
+                    // Submit the successor before reading the prior token on the CPU.
+                    asyncEval(token)
+                    if index > 1 { output[index - 1] = previous.item(Int32.self) }
+                    if index == Int(tokenCount) - 1 { output[index] = token.item(Int32.self) }
+                } else {
+                    output[index] = token.item(Int32.self)
+                }
+            }
+        }
+        guard copyLastLogits(result, expectedBatchSize: 1, to: logits) == 0 else { return -1 }
+        timings[0] = first - start
+        timings[1] = ProcessInfo.processInfo.systemUptime - first
+        return 0
+    } catch {
+        setFFIError("greedy pipeline probe failed: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("mlx_model_eval_submit")
+public func mlx_model_eval_submit(_ handle: UnsafeMutableRawPointer?, _ token: Int32) -> Int32 {
+    guard let handle else { return -1 }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    guard !context.deferredEvalPending, token >= 0, Int(token) < context.config.vocabSize else { return -1 }
+    guard context.model is Rwkv7Model,
+        context.cache.allSatisfy({ !$0.state.isEmpty && $0.state.allSatisfy({ $0.dim(0) == 1 }) })
+    else { return -2 }
+    let previousState = context.cache.map { $0.state }
+    context.invalidateGreedy()
+    do {
+        let result = try evaluateModel(context, input: LMInput(tokens: MLXArray([token])))
+        guard result.ndim == 3, result.dim(0) == 1, result.dim(1) > 0,
+            result.dim(2) == context.config.vocabSize else {
+            throw NSError(domain: "MLXModelFFI", code: 6, userInfo: [NSLocalizedDescriptionKey: "invalid deferred logits shape"])
+        }
+        asyncEval(result)
+        context.greedyLogits = result
+        context.deferredEvalPending = true
+        return 0
+    } catch {
+        for index in context.cache.indices { context.cache[index].state = previousState[index] }
+        context.invalidateGreedy()
+        setFFIError("deferred eval failed: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("mlx_model_eval_finish")
+public func mlx_model_eval_finish(_ handle: UnsafeMutableRawPointer?, _ logits: UnsafeMutablePointer<Float>?) -> Int32 {
+    guard let handle, let logits else { return -1 }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    guard context.deferredEvalPending, let result = context.greedyLogits else { return -2 }
+    let status = copyLastLogits(result, expectedBatchSize: 1, to: logits)
+    context.deferredEvalPending = false
+    return status
+}
+
+// One speculative token is retained so stop/cancel can restore the prior state.
+@_cdecl("mlx_device_greedy_step")
+public func mlx_device_greedy_step(
+    _ handle: UnsafeMutableRawPointer?, _ token: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    guard let handle, let token else { return -1 }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    guard !context.deferredEvalPending, context.model is Rwkv7Model, let previousLogits = context.greedyLogits,
+        previousLogits.ndim == 3, previousLogits.dim(0) == 1,
+        previousLogits.dim(1) > 0, previousLogits.dim(2) == context.config.vocabSize,
+        context.cache.allSatisfy({ !$0.state.isEmpty && $0.state.allSatisfy({ $0.dim(0) == 1 }) })
+    else { return -2 }
+    let previousState = context.cache.map { $0.state }
+    let previousToken = context.greedyToken ?? argMax(previousLogits[0, -1, 0...]).asType(.int32)
+    do {
+        let result = try evaluateModel(context, input: LMInput(tokens: previousToken.reshaped(1)))
+        let nextToken = argMax(result[0, -1, 0...]).asType(.int32)
+        asyncEval(nextToken)
+        token.pointee = previousToken.item(Int32.self)
+        context.greedyLogits = result
+        context.greedyToken = nextToken
+        context.greedyRollbackState = previousState
+        context.greedyRollbackLogits = previousLogits
+        return 0
+    } catch {
+        for index in context.cache.indices { context.cache[index].state = previousState[index] }
+        context.invalidateGreedy()
+        setFFIError("device greedy step failed: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("mlx_device_greedy_finish")
+public func mlx_device_greedy_finish(
+    _ handle: UnsafeMutableRawPointer?, _ rollback: Int32,
+    _ logits: UnsafeMutablePointer<Float>?
+) -> Int32 {
+    guard let handle, let logits, rollback == 0 || rollback == 1 else { return -1 }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    guard !context.deferredEvalPending else { return -2 }
+    if rollback == 1 {
+        guard let state = context.greedyRollbackState, let result = context.greedyRollbackLogits,
+            state.count == context.cache.count else { return -1 }
+        for index in context.cache.indices { context.cache[index].state = state[index] }
+        context.greedyLogits = result
+    }
+    guard let result = context.greedyLogits else { return -2 }
+    let status = copyLastLogits(result, expectedBatchSize: 1, to: logits)
+    context.invalidateGreedy()
+    return status
+}
+
+// The caller must verify this proposal with its unchanged CPU sampler before accepting it.
+@_cdecl("mlx_device_sample_proposal")
+public func mlx_device_sample_proposal(
+    _ handle: UnsafeMutableRawPointer?, _ temperature: Float, _ topK: Int32,
+    _ topP: Float, _ randomDraw: UInt32, _ biasIds: UnsafePointer<Int32>?,
+    _ biases: UnsafePointer<Float>?, _ biasCount: Int32,
+    _ token: UnsafeMutablePointer<Int32>?, _ priorLogits: UnsafeMutablePointer<Float>?
+) -> Int32 {
+    guard let handle, let token, let priorLogits, temperature.isFinite,
+        topP.isFinite, topP > 0.0001, topP <= 1, topK > 1, topK <= 256,
+        randomDraw >= 1, randomDraw <= 2147483646, biasCount >= 0,
+        biasCount == 0 || (biasIds != nil && biases != nil) else { return -1 }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    guard !context.deferredEvalPending, context.model is Rwkv7Model,
+        let previousLogits = context.greedyLogits,
+        previousLogits.ndim == 3, previousLogits.dim(0) == 1,
+        previousLogits.dim(1) > 0, previousLogits.dim(2) == context.config.vocabSize,
+        Int(topK) <= context.config.vocabSize, Int(biasCount) <= context.config.vocabSize,
+        context.cache.allSatisfy({ !$0.state.isEmpty && $0.state.allSatisfy({ $0.dim(0) == 1 }) })
+    else { return -2 }
+    var ids = [Int32](), values = [Float]()
+    if biasCount > 0 {
+        ids = Array(UnsafeBufferPointer(start: biasIds, count: Int(biasCount)))
+        values = Array(UnsafeBufferPointer(start: biases, count: Int(biasCount)))
+        guard ids.enumerated().allSatisfy({ index, id in
+            id >= 0 && Int(id) < context.config.vocabSize && (index == 0 || ids[index - 1] < id)
+        }), values.allSatisfy({ $0.isFinite }) else { return -1 }
+    }
+    let previousState = context.cache.map { $0.state }
+    do {
+        let verificationLogits = previousLogits[0, -1, 0...].asType(.float32)
+        var adjusted = verificationLogits
+        if !ids.isEmpty { adjusted = adjusted.at[MLXArray(ids)].add(MLXArray(values)) }
+        let indices = argSort(-adjusted)[0..<Int(topK)]
+        let selected = take(adjusted, indices, axis: 0)
+        let weights = exp((selected - selected[0]) / min(5, max(0.1, temperature)))
+        let cumulative = cumsum(weights / sum(weights))
+        let cutoff = minimum(sum((cumulative .< topP).asType(.int32)), MLXArray(topK - 1))
+        let target = cumulative[cutoff] * Float(randomDraw - 1) / Float(2147483645)
+        let choice = minimum(sum((cumulative .< target).asType(.int32)), cutoff)
+        let proposal = indices[choice].asType(.int32)
+        asyncEval(proposal)
+        let result = try evaluateModel(context, input: LMInput(tokens: proposal.reshaped(1)))
+        asyncEval(result)
+        // Reuse the already submitted view; a new slice would queue behind the next forward.
+        let verificationData = verificationLogits.asData(access: .copy)
+        verificationData.data.withUnsafeBytes { bytes in
+            priorLogits.initialize(from: bytes.bindMemory(to: Float.self).baseAddress!, count: context.config.vocabSize)
+        }
+        token.pointee = proposal.item(Int32.self)
+        context.greedyLogits = result
+        context.greedyToken = nil
+        context.greedyRollbackState = previousState
+        context.greedyRollbackLogits = previousLogits
+        return 0
+    } catch {
+        for index in context.cache.indices { context.cache[index].state = previousState[index] }
+        context.invalidateGreedy()
+        setFFIError("device sample proposal failed: \(error)")
+        return -1
+    }
 }
