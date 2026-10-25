@@ -11,6 +11,7 @@ import MLXFast
 import MLXLMCommon
 import MLXNN
 import MLXRandom
+import Metal
 
 public struct Rwkv7Configuration: Codable, Sendable {
     var modelType: String
@@ -88,6 +89,21 @@ private func compileL2Norm() -> @Sendable (MLXArray) -> MLXArray {
 private let rwkvAddCMul = compileAddCMul()
 private let rwkvL2Norm = compileL2Norm()
 
+private let rwkvValueRowsSupported = GPU.deviceInfo().architecture.hasPrefix("applegpu_g16")
+
+// Automatic defaults are limited to the desktop GPU measured by the paired gates.
+private let rwkvMeasuredDesktop: Bool = {
+    #if os(macOS)
+    return MTLCreateSystemDefaultDevice()?.name == "Apple M4 Pro"
+        && rwkvValueRowsSupported
+    #else
+    return false
+    #endif
+}()
+private let rwkvValueRowsEnabled = (ProcessInfo.processInfo.environment["RWKV_MLX_VALUE_ROWS"]
+    ?? (rwkvMeasuredDesktop ? "8" : "1")) == "8"
+private let rwkvTraceWkvLaunch = ProcessInfo.processInfo.environment["RWKV_MLX_TRACE_WKV"] == "1"
+
 private func makeWkv7Kernel() -> MLXFast.MLXFastKernel? {
     let source = """
         auto n = thread_position_in_grid.z;
@@ -160,13 +176,86 @@ private func makeWkv7Kernel() -> MLXFast.MLXFastKernel? {
     )
 }
 
+private func makeWkv7ValueRowsKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / H;
+        auto h_idx = n % H;
+        constexpr int n_per_t = D / 32;
+        auto r_ = r + b_idx * T * H * D + h_idx * D;
+        auto w_ = w + b_idx * T * H * D + h_idx * D;
+        auto k_ = k + b_idx * T * H * D + h_idx * D;
+        auto v_ = v + b_idx * T * H * D + h_idx * D;
+        auto a_ = a + b_idx * T * H * D + h_idx * D;
+        auto b_ = b + b_idx * T * H * D + h_idx * D;
+        y += b_idx * T * H * D + h_idx * D;
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_base = thread_position_in_grid.y * ValueRows;
+        float state[ValueRows][n_per_t];
+        for (int row = 0; row < ValueRows; ++row) {
+          auto i_state = state_in + (n * D + dv_base + row) * D;
+          for (int i = 0; i < n_per_t; ++i) {
+            state[row][i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+          }
+        }
+        for (int t = 0; t < T; ++t) {
+          float sa[ValueRows] = {};
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            auto ai = a_[s_idx];
+            auto wi = w_[s_idx];
+            for (int row = 0; row < ValueRows; ++row) {
+              sa[row] += state[row][i] * ai;
+              state[row][i] = state[row][i] * wi;
+            }
+          }
+          for (int row = 0; row < ValueRows; ++row) sa[row] = simd_sum(sa[row]);
+          float out[ValueRows] = {};
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            auto ki = k_[s_idx];
+            auto bi = b_[s_idx];
+            auto ri = r_[s_idx];
+            for (int row = 0; row < ValueRows; ++row) {
+              state[row][i] = state[row][i] + ki * v_[dv_base + row] + sa[row] * bi;
+              out[row] += state[row][i] * ri;
+            }
+          }
+          for (int row = 0; row < ValueRows; ++row) {
+            out[row] = simd_sum(out[row]);
+            if (thread_index_in_simdgroup == 0) y[dv_base + row] = static_cast<InT>(out[row]);
+          }
+          r_ += H * D;
+          w_ += H * D;
+          k_ += H * D;
+          v_ += H * D;
+          a_ += H * D;
+          b_ += H * D;
+          y += H * D;
+        }
+        for (int row = 0; row < ValueRows; ++row) {
+          auto o_state = state_out + (n * D + dv_base + row) * D;
+          for (int i = 0; i < n_per_t; ++i) o_state[n_per_t * dk_idx + i] = static_cast<InT>(state[row][i]);
+        }
+    """
+
+    return MLXFast.metalKernel(
+        name: "wkv7_value_rows_kernel",
+        inputNames: ["r", "w", "k", "v", "a", "b", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+}
+
 private final class Wkv7KernelManager: @unchecked Sendable {
     static let shared = Wkv7KernelManager()
 
     let wkv7Kernel: MLXFast.MLXFastKernel?
+    let valueRowsKernel: MLXFast.MLXFastKernel?
 
     private init() {
         wkv7Kernel = makeWkv7Kernel()
+        valueRowsKernel = makeWkv7ValueRowsKernel()
     }
 }
 
@@ -181,6 +270,24 @@ func wkv7Kernel(
 ) -> (MLXArray, MLXArray) {
     let (B, T, H, D) = (r.dim(0), r.dim(1), r.dim(2), r.dim(3))
     let inputType = r.dtype
+
+    if rwkvValueRowsEnabled, inputType == .float16, D == 64,
+        rwkvValueRowsSupported,
+        let kernel = Wkv7KernelManager.shared.valueRowsKernel {
+        if rwkvTraceWkvLaunch {
+            print("RWKV_WKV_LAUNCH valueRows=8 groupRows=4 B=\(B) T=\(T) H=\(H) D=\(D)")
+        }
+        let outputs = kernel(
+            [r, w, k, v, a, b, state, T],
+            template: [("InT", inputType), ("H", H), ("D", D), ("ValueRows", 8)],
+            grid: (32, D / 8, B * H), threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, H, D], state.shape], outputDTypes: [inputType, inputType]
+        )
+        return (outputs[0], outputs[1])
+    }
+    if rwkvTraceWkvLaunch {
+        print("RWKV_WKV_LAUNCH valueRows=1 groupRows=4 B=\(B) T=\(T) H=\(H) D=\(D)")
+    }
 
     guard let kernel = Wkv7KernelManager.shared.wkv7Kernel else {
         fatalError("Wkv7 kernel not available")
@@ -433,8 +540,9 @@ private class Rwkv7ChannelMixing: Module {
     }
 }
 
-// Experimental decode-only scope; recurrent state remains explicit graph input/output.
-private let rwkvCompileScope = ProcessInfo.processInfo.environment["RWKV_MLX_COMPILE_SCOPE"] ?? "baseline"
+// Recurrent state remains explicit graph input/output in the measured decode scope.
+private let rwkvCompileScopeOverride = ProcessInfo.processInfo.environment["RWKV_MLX_COMPILE_SCOPE"]
+private let rwkvCompileScope = rwkvCompileScopeOverride ?? (rwkvMeasuredDesktop ? "step" : "baseline")
 
 private class Rwkv7Layer: Module {
     let config: Rwkv7Configuration
@@ -550,7 +658,8 @@ public class Rwkv7Model: Module, LLMModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         if rwkvCompileScope == "step", inputs.dim(1) == 1,
             let cache, cache.count == model.layers.count,
-            cache.allSatisfy({ ($0 as? RwkvCache)?.state.count == 3 }) {
+            cache.allSatisfy({ ($0 as? RwkvCache)?.state.count == 3 }),
+            rwkvCompileScopeOverride != nil || (args.headDim == 64 && cache.first?.state[1].dtype == .float16) {
             let outputs = compiledDecode([inputs] + cache.flatMap { $0.state })
             for (i, layerCache) in cache.enumerated() {
                 (layerCache as! RwkvCache).state = Array(outputs[(1 + i * 3)..<(4 + i * 3)])
