@@ -45,6 +45,17 @@ int mlx_model_eval(
     float *logits
 );
 
+// Step evaluates the selected token speculatively; finish commits or rolls it back.
+int mlx_device_greedy_step(void *handle, int32_t *token);
+int mlx_device_greedy_finish(void *handle, int32_t rollback, float *logits);
+int mlx_model_eval_submit(void *handle, int32_t token);
+int mlx_model_eval_finish(void *handle, float *logits);
+
+// Verify with the CPU sampler; greedy_finish(rollback=1) corrects a rejected proposal.
+int mlx_device_sample_proposal(void *handle, float temperature, int32_t top_k,
+    float top_p, uint32_t random_draw, const int32_t *bias_ids, const float *biases,
+    int32_t bias_count, int32_t *token, float *prior_logits);
+
 // Evaluates one token per batch slot.
 // ids: array of token IDs, one per slot
 // batch_size: number of active batch slots

@@ -433,6 +433,9 @@ private class Rwkv7ChannelMixing: Module {
     }
 }
 
+// Experimental decode-only scope; recurrent state remains explicit graph input/output.
+private let rwkvCompileScope = ProcessInfo.processInfo.environment["RWKV_MLX_COMPILE_SCOPE"] ?? "baseline"
+
 private class Rwkv7Layer: Module {
     let config: Rwkv7Configuration
     let attn: Rwkv7TimeMixing
@@ -442,6 +445,15 @@ private class Rwkv7Layer: Module {
     @ModuleInfo(key: "pre_norm") var preNorm: LayerNorm?
 
     let layerIdx: Int
+
+    private lazy var compiledDecode = compile { [unowned self] (inputs: [MLXArray]) in
+        precondition(inputs.count == 5)
+        print("RWKV_MLX_TRACE layer=\(self.layerIdx) batch=\(inputs[0].dim(0))")
+        let cache = RwkvCache()
+        cache.state = Array(inputs[2...])
+        let (x, vFirst) = self.forward(inputs[0], vFirst: self.layerIdx == 0 ? nil : inputs[1], cache: cache)
+        return [x, vFirst!] + cache.state
+    }
 
     init(_ config: Rwkv7Configuration, layerIdx: Int) {
         self.config = config
@@ -459,6 +471,18 @@ private class Rwkv7Layer: Module {
     }
 
     func callAsFunction(
+        _ x: MLXArray, vFirst: MLXArray?, cache: KVCache?
+    ) -> (MLXArray, MLXArray?) {
+        if rwkvCompileScope == "layer", x.dim(1) == 1,
+            let cache = cache as? RwkvCache, cache.state.count == 3 {
+            let outputs = compiledDecode([x, vFirst ?? x] + cache.state)
+            cache.state = Array(outputs[2...])
+            return (outputs[0], outputs[1])
+        }
+        return forward(x, vFirst: vFirst, cache: cache)
+    }
+
+    private func forward(
         _ x: MLXArray, vFirst: MLXArray?, cache: KVCache?
     ) -> (MLXArray, MLXArray?) {
         let x = self.preNorm?(x).asType(.float16) ?? x
@@ -502,6 +526,18 @@ public class Rwkv7Model: Module, LLMModel {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    private lazy var compiledDecode = compile { [unowned self] (inputs: [MLXArray]) in
+        precondition(inputs.count == 1 + self.model.layers.count * 3)
+        print("RWKV_MLX_TRACE step batch=\(inputs[0].dim(0))")
+        let caches = self.model.layers.indices.map { i in
+            let cache = RwkvCache()
+            cache.state = Array(inputs[(1 + i * 3)..<(4 + i * 3)])
+            return cache
+        }
+        let logits = self.forward(inputs[0], cache: caches)
+        return [logits] + caches.flatMap { $0.state }
+    }
+
     public init(_ config: Rwkv7Configuration) {
         self.args = config
         self.model = Rwkv7ModelInner(config)
@@ -512,7 +548,32 @@ public class Rwkv7Model: Module, LLMModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if rwkvCompileScope == "step", inputs.dim(1) == 1,
+            let cache, cache.count == model.layers.count,
+            cache.allSatisfy({ ($0 as? RwkvCache)?.state.count == 3 }) {
+            let outputs = compiledDecode([inputs] + cache.flatMap { $0.state })
+            for (i, layerCache) in cache.enumerated() {
+                (layerCache as! RwkvCache).state = Array(outputs[(1 + i * 3)..<(4 + i * 3)])
+            }
+            return outputs[0]
+        }
+        return forward(inputs, cache: cache)
+    }
+
+    /// Consume every token while projecting only the final rows to logits.
+    public func lastLogits(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if inputs.dim(1) == 1 {
+            return callAsFunction(inputs, cache: cache)
+        }
+        return forward(inputs, cache: cache, lastTokenOnly: true)
+    }
+
+    private func forward(_ inputs: MLXArray, cache: [KVCache]?, lastTokenOnly: Bool = false) -> MLXArray {
         var outputs = model(inputs, cache: cache)
+        if lastTokenOnly && outputs.dim(1) > 16 {
+            // Keep 16 rows to preserve the quantized GEMM reduction and bitwise logits.
+            outputs = outputs[0..., (-16)..., 0...]
+        }
 
         if let lmHead {
             outputs = lmHead(outputs)
