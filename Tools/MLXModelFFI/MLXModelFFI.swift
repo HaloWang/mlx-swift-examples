@@ -9,6 +9,24 @@ import Foundation
 import MLXLMCommon
 import MLXLLM
 import MLX
+import Metal
+
+private let rwkvMeasuredDesktopFFI: Bool = {
+    #if os(macOS)
+    return MTLCopyAllDevices().first?.name == "Apple M4 Pro"
+    #else
+    return false
+    #endif
+}()
+private func rwkvDesktopOption(_ name: String) -> Bool {
+    #if os(macOS)
+    return ProcessInfo.processInfo.environment[name].map { $0 == "1" } ?? rwkvMeasuredDesktopFFI
+    #else
+    return false
+    #endif
+}
+private let rwkvLazyClearEnabled = rwkvDesktopOption("RWKV_MLX_LAZY_CLEAR")
+private let rwkvLazyClearTrace = ProcessInfo.processInfo.environment["RWKV_MLX_TRACE_LAZY_CLEAR"] == "1"
 
 private final class ModelContext {
     let modelDirectory: URL
@@ -164,6 +182,7 @@ public func mlx_model_load(_ cPath: UnsafePointer<CChar>?) -> UnsafeMutableRawPo
 public func mlx_model_release(_ handle: UnsafeMutableRawPointer?) {
     guard let handle else { return }
     Unmanaged<ModelContext>.fromOpaque(handle).release()
+    if rwkvMeasuredDesktopFFI { eval(MLXRandom.globalState) }
     GPU.clearCache()
 }
 
@@ -562,6 +581,7 @@ private func zeroCacheSlot(_ context: ModelContext, slot: Int) -> Int32 {
     context.invalidateGreedy()
     for cacheIndex in 0..<context.cache.count {
         let state = context.cache[cacheIndex].state
+        if rwkvLazyClearEnabled, context.model is Rwkv7Model, context.config.headDim == 64, state.isEmpty { continue }
         let shapes = slotShapes(for: context.cache[cacheIndex], context: context)
         let currentArrays: [MLXArray?] = state.isEmpty ? Array(repeating: nil, count: shapes.count) : state.map { Optional($0) }
         var cacheState: [MLXArray] = []
@@ -652,6 +672,21 @@ public func mlx_cache_write_slot(
 
     let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
     return writeCacheSlot(context, slot: Int(slot), buffer: buffer, bufferSize: bufferSize)
+}
+
+// Keep zero slots implicit until evaluation or a slot write materializes state.
+@_cdecl("mlx_cache_zero_all")
+public func mlx_cache_zero_all(_ handle: UnsafeMutableRawPointer?) -> Int32 {
+    guard let handle else {
+        setFFIError("handle is null")
+        return -1
+    }
+    let context = Unmanaged<ModelContext>.fromOpaque(handle).takeUnretainedValue()
+    guard rwkvLazyClearEnabled, context.model is Rwkv7Model, context.config.headDim == 64 else { return -2 }
+    context.invalidateGreedy()
+    context.cache = context.model.newCache(parameters: nil)
+    if rwkvLazyClearTrace { print("RWKV_LAZY_CLEAR allSlots=implicitZero") }
+    return 0
 }
 
 @_cdecl("mlx_cache_zero_slot")

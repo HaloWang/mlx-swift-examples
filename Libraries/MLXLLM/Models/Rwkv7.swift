@@ -536,7 +536,8 @@ private class Rwkv7ChannelMixing: Module {
         }
         let xPrev = self.tokenShift(x, state)
         let xx = rwkvAddCMul(x, xPrev - x, self.xK)
-        return self.value(reluSquared(self.key(xx)))
+        let activated = reluSquared(self.key(xx))
+        return self.value(activated)
     }
 }
 

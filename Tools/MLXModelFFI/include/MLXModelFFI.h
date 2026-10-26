@@ -110,6 +110,9 @@ int mlx_cache_write_slot(
     int32_t buffer_size
 );
 
+// Optional whole-cache reset: 0 on success, -2 when disabled/unsupported, -1 for null handle.
+int mlx_cache_zero_all(void *handle);
+
 // Clears a single batch slot in the cache.
 // Returns 0 on success, -1 on failure.
 int mlx_cache_zero_slot(
